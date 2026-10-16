@@ -1,0 +1,107 @@
+# Run Myriaxon with one command, and nothing installed on the host.
+#
+#   docker compose run --rm myriaxon                 the terminal agent
+#   docker compose up dashboard                      the dashboard at http://127.0.0.1:8765
+#
+# WHY COMPOSE RATHER THAN A LONG `docker run`
+#
+# The `docker run` in the README is correct and complete, and it is also four flags long, of which two
+# (`-it`, the volume mount) are easy to get subtly wrong. Compose makes the mounts and the environment
+# a file a person can read and edit, and it makes the two modes -- terminal and dashboard -- two named
+# services instead of two incantations.
+#
+# The `profiles` key is what keeps `docker compose up` from starting the dashboard when what you wanted
+# was a shell: a service in a profile only runs when that profile is named.
+
+services:
+  # The interactive agent. This is the default thing an image called "harness" should do.
+  myriaxon:
+    build:
+      context: .
+      args:
+        MYRIAXON_VERSION: "0.0.1"
+        # The Docker client, so a confined Locus can use its sandbox. Needs the socket below.
+        WITH_DOCKER_CLI: "true"
+        # MUST match the host's docker group, or the mounted socket is unreadable to this user.
+        # Find it with: getent group docker | cut -d: -f3
+        MYRIAXON_GID: "${DOCKER_GID:-1000}"
+    image: ghcr.io/myriaxon/harness:latest
+    # `stdin_open` and `tty` together are what make the REPL usable. Without them the prompt has no
+    # terminal to read from and the agent exits immediately, which reads as a crash.
+    stdin_open: true
+    tty: true
+    volumes:
+      # CONFIG, KEYS AND SESSIONS. Named volume rather than a bind mount so the first run works on a
+      # host with no `~/.myriaxon` yet, and so the container's non-root user owns it.
+      - myriaxon-config:/home/myriaxon/.myriaxon
+      # THE PROJECT BEING WORKED ON. A bind mount, because the point is that the agent edits files you
+      # can then open in your own editor. `MYRIAXON_WORKSPACE` in `.env` overrides the default.
+      - ${MYRIAXON_WORKSPACE:-.}:/workspace
+    environment:
+      # Read from `.env` beside this file, which is gitignored. The container inherits only what is
+      # named here, so a key in your shell does not leak in by accident.
+      MYRIAXON_PROVIDER: ${MYRIAXON_PROVIDER:-}
+      MYRIAXON_MODEL: ${MYRIAXON_MODEL:-}
+      MYRIAXON_API_KEY: ${MYRIAXON_API_KEY:-}
+      MYRIAXON_BASE_URL: ${MYRIAXON_BASE_URL:-}
+      NETRA_API_KEY: ${NETRA_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GOOGLE_GENAI_USE_VERTEXAI: ${GOOGLE_GENAI_USE_VERTEXAI:-}
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
+      GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION:-}
+      # How much of what the machine does is shown. See docs/HOW-TO-USE.md.
+      MYRIAXON_TRANSPARENCY: ${MYRIAXON_TRANSPARENCY:-3}
+
+  dashboard:
+    profiles: ["dashboard"]
+    image: ghcr.io/myriaxon/harness:latest
+    build:
+      context: .
+      args:
+        MYRIAXON_VERSION: "0.0.1"
+        WITH_DOCKER_CLI: "true"
+        MYRIAXON_GID: "${DOCKER_GID:-1000}"
+    # `--host 0.0.0.0` is REQUIRED and is not a convenience. The dashboard binds 127.0.0.1 by default,
+    # which inside a container means the port is published and still unreachable. The default is
+    # deliberate in the server -- loopback is the safe choice for a tool that can read your files -- so
+    # widening it has to be an explicit choice made here rather than a container changing it quietly.
+    command: ["web", "--no-browser", "--host", "0.0.0.0"]
+    ports:
+      # Bound to 127.0.0.1 on the HOST, so the dashboard is reachable from this machine and not from
+      # the network. Changing this to `8765:8765` exposes a tool with file access to your LAN, which is
+      # a decision to make on purpose.
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - myriaxon-config:/home/myriaxon/.myriaxon
+      - ${MYRIAXON_WORKSPACE:-.}:/workspace
+    environment:
+      MYRIAXON_PROVIDER: ${MYRIAXON_PROVIDER:-}
+      MYRIAXON_MODEL: ${MYRIAXON_MODEL:-}
+      MYRIAXON_API_KEY: ${MYRIAXON_API_KEY:-}
+      MYRIAXON_BASE_URL: ${MYRIAXON_BASE_URL:-}
+      NETRA_API_KEY: ${NETRA_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GOOGLE_GENAI_USE_VERTEXAI: ${GOOGLE_GENAI_USE_VERTEXAI:-}
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
+      GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION:-}
+      MYRIAXON_TRANSPARENCY: ${MYRIAXON_TRANSPARENCY:-8}
+    restart: unless-stopped
+    healthcheck:
+      # The image's own healthcheck, restated so `docker compose ps` reports it without needing the
+      # image to be pulled first.
+      test: ["CMD", "python", "-m", "myriaxon", "--version"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  myriaxon-config:
+    # Named rather than anonymous so `docker compose down` does not silently discard saved API keys and
+    # session history. Removing it is `docker volume rm` -- an explicit act.

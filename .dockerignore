@@ -1,0 +1,75 @@
+# What must NOT go into the image build context.
+#
+# This file is not only about size. `COPY . .` in the Dockerfile means every file here would otherwise
+# be shipped into a layer, and this repository's own `.gitignore` documents two categories that must
+# never leave the machine: a real `.env` holding live API keys, and `~/.myriaxon` state. The build
+# context is sent to the Docker daemon BEFORE any instruction runs, so a secret in the context has
+# already left the machine even if no later step copies it.
+#
+# `.dockerignore` is therefore a security control here, not a build optimisation.
+
+# --- secrets, first because they matter most -------------------------------------------------
+.env
+.env.*
+!.env.example
+*.env.bak
+.myriaxon/
+.iohcode/
+
+# --- version control and CI --------------------------------------------------------------------
+# `.git` is the largest thing in most build contexts and the only part that is genuinely useless
+# inside: a full object store, often larger than the source. The Dockerfile needs no history -- the
+# build revision arrives as a LABEL argument instead.
+.git/
+.gitattributes
+.github/
+
+# --- what the image does not need --------------------------------------------------------------
+# Tests, docs and packaging config are for people working ON the project, not for running it. The
+# built-in skills and IQB-14 task suite are NOT here: `package-data` ships them in the wheel, so
+# excluding the source directory would remove them from the installed copy.
+tests/
+docs/
+bench-out/
+redteam/
+posters/
+brand/
+docker/
+
+# ...EXCEPT the entrypoint, which lives in docker/ but is part of the application image rather than the
+# sandbox build. The `docker/` rule above is there to keep the SANDBOX Dockerfile (and its apt package
+# list) out of the application context; without this exception the entrypoint is excluded too, and the
+# image either fails to build or silently gets a stale copy. The negation has to come after the rule it
+# undoes -- `.dockerignore` applies patterns in order, and the last match wins, exactly like .gitignore.
+!docker/entrypoint.py
+
+# --- build and cache artefacts -----------------------------------------------------------------
+# A stale local `build/` would be copied in and `pip install .` could resolve the OLD tree, which is
+# how an image silently contains the previous commit.
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# --- editor and OS noise -----------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*~
+Thumbs.db
+desktop.ini
+
+# --- anything a previous run left behind -------------------------------------------------------
+# Generated output and scratch files. `*-proof.txt` and `ANKER_*.md` are in `.gitignore` for the same
+# reason: a Locus working in this repository writes documents here, and they are not source.
+*.log
+*.bundle
+ANKER_*.md
+*-proof.txt
+task.md

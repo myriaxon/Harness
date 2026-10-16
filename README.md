@@ -984,6 +984,7 @@ python scripts\check_ui_visual.py     # real Chrome via CDP; skip when no browse
 | [docs/HOW-TO-USE.md](docs/HOW-TO-USE.md) | **start here**: install, first run, dashboard, transparency dial, loci, troubleshooting |
 | [docs/API-KEYS.md](docs/API-KEYS.md) | **DeepSeek, Netra, Vertex, Ollama keys**, precedence, and where a key is never written |
 | [docs/FALSE-POSITIVE.md](docs/FALSE-POSITIVE.md) | **if an antivirus flags `myriaxon.exe`** — what the file is, how to verify it, and what cannot be fixed here |
+| [docs/DOCKER.md](docs/DOCKER.md) | **running it in a container**: the two images, one-command install, nested Locus sandbox, known limits |
 | [docs/BRAND.md](docs/BRAND.md) | the identity: mark geometry, palette, type, terminal glyphs, CLI themes |
 | [docs/IQB-14.md](docs/IQB-14.md) | the evaluation standard, normative |
 | [docs/MCP-SETUP.md](docs/MCP-SETUP.md) | connecting stdio and remote MCP servers |

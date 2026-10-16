@@ -117,6 +117,19 @@ RUN git config --system user.email "agent@myriaxon.local" \
  && git config --system user.name "Myriaxon Agent" \
  && git config --system --add safe.directory /workspace
 
+# /workspace MUST EXIST AND BE OWNED BY THE SANDBOX USER, and until this line was added it was not.
+#
+# Measured: `docker run --rm myriaxon-sandbox:latest touch /workspace/x` failed with
+# `Permission denied` -- with no mount at all, on the image's OWN workspace. The cause is that
+# `WORKDIR /workspace` is a convenience instruction: Docker CREATES the directory when it does not
+# exist, as root, and `WORKDIR` runs AFTER `USER sandbox` below. So the one directory every confined
+# Locus writes to was root-owned and read-only to the user meant to work in it.
+#
+# A bind-mounted workspace was unaffected, because the mount replaces the directory -- which is exactly
+# why this hid: the common case worked, and the image's own default workspace did not. Anything that
+# ran without a mount (a plain `docker run ... bash`, a diagnostic, a test) hit it instead.
+RUN mkdir -p /workspace && chown -R sandbox:sandbox /workspace
+
 WORKDIR /workspace
 USER sandbox
 

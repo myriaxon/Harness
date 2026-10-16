@@ -1,0 +1,123 @@
+name: Container
+
+# Publishes the application image, so installing Myriaxon is one `docker run` instead of Python,
+# a virtualenv and four dependencies.
+#
+# A SEPARATE WORKFLOW FROM `ci.yml`, for two reasons that both matter:
+#
+#   1. **Different permissions.** Publishing needs `packages: write`; `ci.yml` deliberately declares
+#      `contents: read` as least privilege. Widening the CI workflow's token so that a container job
+#      can publish would give every test step a token that can push images.
+#   2. **Different triggers.** This one publishes only on a version tag or a manual dispatch. `ci.yml`
+#      runs on every push, and building an image on every push would spend minutes to produce a tag
+#      nobody asked for.
+#
+# NOT TO BE CONFUSED WITH `docker/Dockerfile`, which is the sandbox image a confined Locus runs
+# INSIDE. That one is built on demand by the user and is not published here.
+
+on:
+  push:
+    # A version tag, not a branch. `v0.0.1` publishes `0.0.1`, `0.0`, `0` and `latest`; an ordinary
+    # commit publishes nothing, so the registry does not fill with unreleased images.
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Also push to the registry (otherwise build only)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: container-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: build the image (and publish on a tag)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `docker buildx` rather than plain `docker build`: buildx is what can produce a multi-arch
+      # manifest, and a published image that only runs on amd64 is not "deployable everywhere" --
+      # it fails on every Apple Silicon laptop with a confusing exec-format error.
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Work out the version
+        id: meta
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            # A dispatch with no tag still builds, but publishes nothing. Reading the version from the
+            # source keeps one authority for it rather than a second copy in the workflow.
+            echo "version=$(python3 -c 'import re,pathlib;print(re.search(r"VERSION\s*=\s*\"([^\"]+)\"", pathlib.Path("myriaxon/constants.py").read_text()).group(1))')" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to the registry
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The tags a user actually types. `latest` for the impatient, the exact version for a
+      # reproducible build, and the minor for someone who wants fixes without surprises.
+      - name: Compose the tags and labels
+        id: tags
+        run: |
+          IMAGE="ghcr.io/${{ github.repository_owner }}/harness"
+          IMAGE=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')   # registries require lowercase
+          V="${{ steps.meta.outputs.version }}"
+          MINOR=$(echo "$V" | cut -d. -f1,2)
+          {
+            echo "image=$IMAGE"
+            echo "tags<<EOF"
+            echo "$IMAGE:$V"
+            echo "$IMAGE:$MINOR"
+            echo "$IMAGE:latest"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build (and push on a tag)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          # Pushed only for a real release. A pull request or a dispatch without `publish` builds the
+          # image to prove the Dockerfile works, which is the part that would otherwise break silently.
+          push: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.publish }}
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            MYRIAXON_VERSION=${{ steps.meta.outputs.version }}
+            MYRIAXON_REVISION=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # A PUBLISHED IMAGE THAT DOES NOT RUN IS WORSE THAN NO IMAGE, because the failure reaches the
+      # user instead of the maintainer. This runs the container the way the README tells a user to and
+      # asserts the two things installation is supposed to guarantee: it starts, and it answers.
+      # Loaded from cache rather than pulled, since `push` may have been false.
+      - name: Prove the image runs
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.tags.outputs.image }}:${{ steps.meta.outputs.version }}"
+          docker buildx build --load --platform linux/amd64 \
+            --build-arg MYRIAXON_VERSION="${{ steps.meta.outputs.version }}" \
+            --build-arg MYRIAXON_REVISION="${{ github.sha }}" \
+            -t myriaxon-test:local .
+          echo "--- --version ---"
+          docker run --rm myriaxon-test:local --version
+          echo "--- --help exits 0 ---"
+          docker run --rm myriaxon-test:local --help > /dev/null
+          echo "--- the config directory is writable by the non-root user ---"
+          docker run --rm myriaxon-test:local python -c \
+            "import os,pathlib; p=pathlib.Path(os.environ['MYRIAXON_CONFIG_DIR']); p.mkdir(parents=True, exist_ok=True); (p/'probe').write_text('ok'); print('writable:', p)"
+          echo "--- and it does NOT run as root ---"
+          docker run --rm myriaxon-test:local python -c \
+            "import os,sys; print('uid', os.getuid()); sys.exit(1 if os.getuid() == 0 else 0)"
