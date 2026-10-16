@@ -1,0 +1,134 @@
+name: CI
+
+# Everything that runs here can be run on your own machine with one command:
+#
+#     python tools/run_checks.py
+#
+# so a red run is reproducible, and a green one means the same thing on a laptop as on the runner.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same branch makes the older run pointless.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: static checks (names, imports, duplicates)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install with the development tools
+        run: python -m pip install -e ".[dev]"
+      - name: Fail on a name that does not exist, an import of nothing, or a duplicate definition
+        run: python tools/verify_names.py
+
+  test:
+    name: pytest (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install with the development tools
+        run: python -m pip install -e ".[dev]"
+      - name: Run the test suite
+        run: python -m pytest
+
+  verify:
+    name: verifiers (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install with the development tools and every optional package
+        run: python -m pip install -e ".[dev,all]"
+      - name: Run every verifier, each in its own sandbox
+        shell: python
+        run: |
+          import subprocess, sys
+
+          # An explicit list, not a glob: a verifier that silently stops being run is how a guarantee disappears.
+          # tools/verify_ci.py checks that every name here exists on disk AND that every verifier on disk is listed.
+          VERIFIERS = [
+            "verify_always_on", "verify_boundaries", "verify_boundaries_wiring",
+            "verify_capability_and_approval", "verify_ci", "verify_compaction_audit", "verify_companion",
+            "verify_deadline", "verify_deletion_idle", "verify_dependencies", "verify_diagnostics",
+            "verify_doctor", "verify_extension_policy", "verify_goal_authority", "verify_guardrails",
+            "verify_health_and_patching", "verify_instructions", "verify_interpreter", "verify_jobs",
+            "verify_loci_autonomy", "verify_loci_capabilities", "verify_loci_character", "verify_loci_e2e",
+            "verify_loci_spec", "verify_locus_autonomy", "verify_locus_failure_ledger", "verify_locus_status",
+            "verify_loop_detection", "verify_migration", "verify_names", "verify_output_schema",
+            "verify_packaging", "verify_perf_gates", "verify_plan_mode", "verify_redaction", "verify_roles",
+            "verify_run_budget", "verify_run_export", "verify_runtime_context", "verify_sandbox_policy",
+            "verify_save_skill_tool", "verify_sdist", "verify_self_awareness", "verify_session_index",
+            "verify_session_lineage", "verify_shadowing", "verify_skill_tools", "verify_skill_trust",
+            "verify_snapshots", "verify_spill", "verify_steering", "verify_tool_catalog", "verify_worktree",
+            "verify_writer_claim"
+          ]
+          sys.exit(subprocess.call([sys.executable, "tools/run_checks.py", "--no-pytest", "--jobs", "4",
+                                    "--show-failures", "--only", ",".join(VERIFIERS)]))
+
+  package:
+    name: build and install (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform's packaging failure must not hide the others' results.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the build tools
+        run: python -m pip install --upgrade "setuptools>=77" build
+      - name: Build the wheel and the source distribution
+        run: python -m build
+      - name: Show what was built
+        shell: bash
+        run: |
+          ls -la dist
+          python -m pip --version
+      - name: Assert the artifacts carry what a user needs
+        shell: python
+        run: |
+          import glob, tarfile, zipfile
+
+          wheel = sorted(glob.glob("dist/*.whl"))[-1]
+          names = zipfile.ZipFile(wheel).namelist()
+          for needed in ("myriaxon/builtin_skills/graphify/SKILL.md",
+                         "myriaxon/builtin_roles/reviewer.md",
+                         "myriaxon/bench/tasks/p01_goal_bugfix_end_to_end/task.json",
+                         "myriaxon/brand/assets/myriaxon-mark.svg",
+                         "myriaxon/py.typed"):
+              assert needed in names, f"the wheel is missing {needed}"
+          sdist = sorted(glob.glob("dist/*.tar.gz"))[-1]
+          members = [n.split("/", 1)[1] for n in tarfile.open(sdist).getnames() if "/" in n]
+          for needed in ("pyproject.toml", "README.md", "LICENSE", "MANIFEST.in"):
+              assert needed in members, f"the sdist is missing {needed}"
+          print("artifacts ok:", wheel, sdist)
