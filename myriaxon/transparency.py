@@ -139,7 +139,20 @@ class Event:
     trusted: bool = True
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        """The event as a plain dict, WITH the human-readable layer name included.
+
+        `asdict` alone omits `layer_name`, because it is a property rather than a field -- so the API served
+        `"layer_name": null` for every event while `event.layer_name` was perfectly correct in Python.
+        Measured against the live server: a refusal at layer 7 serialised as `layer_name: None`.
+
+        That matters beyond tidiness. The dashboard keeps its OWN copy of the layer names in JavaScript, so
+        the two can drift: renaming a layer in Python would leave the UI labelling it with the old name and
+        nothing would fail. Serving the name makes Python the single source of truth, and lets any other
+        consumer label an event without duplicating the table.
+        """
+        data = asdict(self)
+        data["layer_name"] = self.layer_name
+        return data
 
     @property
     def layer_name(self) -> str:
@@ -260,15 +273,30 @@ class Transparency:
     # -- emission ------------------------------------------------------------------------
 
     def emit(self, layer: int, kind: str, *, summary: str = "", detail: dict | None = None,
-             run_id: str = "", locus: str = "", session: str = "", trusted: bool = True) -> Event | None:
+             run_id: str = "", locus: str = "", session: str = "", trusted: bool = True,
+             always: bool = False) -> Event | None:
         """Record an event at `layer`, or return None when the dial is below it.
 
         Returning None rather than a discarded object is deliberate: a caller that wants to skip expensive
         detail can check the return, and the common case costs one integer comparison.
+
+        ``always=True`` IGNORES THE DIAL, and only one category uses it: **a refusal**. The reasoning is the
+        same one that shaped the dial. The dial exists so a person can lower the volume on the ordinary
+        traffic of a working agent -- which tool ran, which file was read -- and that traffic is genuinely
+        optional to watch. A refusal is the opposite: it means something the owner asked for did not happen,
+        and the owner is the one person who needs to know.
+
+        Measured: at the default level 3 the DECISIONS layer (level 7) is off entirely, so a refused run
+        produced NO entry anywhere the user was looking -- only a line in one locus's own activity log. That
+        is exactly the complaint this layer was added to answer ("when every error or stuck happened let me
+        know it from UI"), so it earns an exception rather than a renumbering.
+
+        Deliberately NOT a general escape hatch. Everything else stays gated, because a dial that does not
+        reduce anything is not a dial.
         """
         with self._lock:
             level = self._level
-        if layer == SILENT or layer > level:
+        if layer == SILENT or (layer > level and not always):
             return None
 
         try:

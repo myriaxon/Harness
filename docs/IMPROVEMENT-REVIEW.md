@@ -84,72 +84,129 @@ log spam and never a deadlock.
 
 ---
 
-## OPEN — recommended improvements, in priority order
+## FIXED in this pass, second round — all six open items built
 
-### 3. A Locus run is invisible while it happens — **OPEN, medium**
+### 3. A Locus run was invisible while it happened — **FIXED**
 
-The transcript for a running Locus contained **only the user prompt** for the entire run. A person watching
-the panel cannot tell whether it is thinking, stuck, or dead — and item 1 shows that all three looked
-identical.
+`Locus.end_run` now records `last_outcome` — `{ok, kind, attempts, summary, error, at}` — and the panel
+renders it on the locus card with a "12s ago" age. The server serves it as `last_outcome`; the card shows
+a green or red dot and, on failure, the error text.
 
-**Recommend:** surface the worker's `RunOutcome` on the locus record so the panel can show the last step's
-result, not just "working now". `locus.activity` already records `turn` entries; the *outcome* of the last
-one is what is missing.
+**It has to reach the disk, and the first version did not.** `_loci_payload` reloads from `loci.json` on
+every request, so an outcome held only in memory was discarded before it could be rendered: the field would
+have existed, been correct, and never appeared. `end_run` now persists through `registry.persist`, which
+reloads first and re-inserts THIS locus, so a concurrent edit from the terminal is not reverted.
 
-### 4. `run_locus` and `run_scope` disagree about who decides — **OPEN, medium**
+### 4. Two places decided whether a run could start — **FIXED**
 
-Item 1 is a symptom of a layering problem: **two places decide whether a run may start**, one at submit time
-and one inside the worker, and only the inner one is authoritative. That is the same shape as the two
-execution gates this project already unified behind `shell_may_run`.
+`Locus.may_run()` returns `(ok, reason, holder)` and is now the single answer. `run_locus` asks it at submit
+time and `begin_run` formats its refusal at run time, so the two cannot disagree again. This is the same
+shape as `tools.shell_may_run`, which closed two earlier bypasses for the same reason.
 
-**Recommend:** add `Locus.may_run()` returning `(ok, reason)` and have **both** callers ask it, so the submit
-path cannot report a success the worker will refuse.
+The refusal reason carries the holder's pid and start time, because "already running" without those is the
+kind of message that sends somebody hunting through log files.
 
-### 5. `Locus.is_running()` polls the filesystem on every UI request — **OPEN, low**
+### 5. `is_running()` re-read and re-parsed the lease per UI request — **FIXED**
 
-It reads and parses `run.lease` per call, and the dashboard calls it per locus per poll.
+Cached for one second, invalidated by `_forget_running()` wherever THIS process changes the answer
+(acquiring or releasing). A caller passing an explicit `now` is asking a hypothetical and always gets a
+fresh read, which is what keeps the expiry behaviour testable without waiting out the stale window.
 
-**Recommend:** cache with a short TTL (1–2s). The lease already carries `acquired_at` and a heartbeat, so a
-stale cache is bounded by the same window the lease itself uses.
+### 6. Nothing tested the caller's contract — **FIXED**
 
-### 6. No automated coverage for the failure that items 1 and 2 share — **OPEN, high value**
+`tests/test_locus_run_contract.py` (6 tests) and `tests/test_locus_run_contract_extra.py` (12 tests) assert
+what a surface depends on: `accepted: True` means the run started; a refusal is visible; the outcome is
+served; a dead owner never refuses; and the cache cannot outlive the fact it caches.
 
-`tests/` covers the lease in isolation. **Nothing covered "the API says accepted and nothing happens"**, which
-is why it shipped.
+**Two of these tests were wrong before they were right**, and both times the code was correct:
+the lease fixture first poisoned with a DEAD pid and expected a refusal — but a dead owner is correctly
+reclaimed, so the run proceeded. The pid is now explicit and the held case uses a live one.
 
-**Recommend:** a test that asserts the invariant directly — *if `run_locus` returns `accepted: True`, then
-either the transcript grows or the locus's activity records a refusal*. Written against a poisoned lease, so
-it fails on the pre-fix code.
+### 7. `running: True` with `session_id: None` — **FIXED**
 
-### 7. `session_id: None` while `running: True` is a state no caller can use — **OPEN, low**
+The payload now carries `has_session` explicitly, so a panel does not have to infer whether a transcript
+exists from two fields that can disagree.
 
-The two fields contradict each other. After item 1's fix the contradiction is harder to reach, but the
-record can still hold it.
+### 8. Refusals appeared only in the locus's activity log — **FIXED, and it was worse than reported**
 
-**Recommend:** treat `running` as derived (`is_running()`) rather than stored, or assert the pair cannot
-disagree.
+The investigation found that `transparency.emit` had **exactly one call site in the entire codebase**, and
+it was `set_level` announcing that the level had changed. The DECISIONS layer — described in the module as
+"gates: refusals, confirmations, risk, budget" — **had never emitted anything at all.** A dial offering a
+category of event the program never produces is not transparency; it is a panel that looks wired up.
 
-### 8. The activity log is the only place some refusals appear — **OPEN, low**
+Two changes:
+* Locus run refusals now emit at DECISIONS with `detail.gate = "locus-run"`, so the feed says which gate
+  refused.
+* `emit(..., always=True)` bypasses the dial for **refusals only**. At the default level 3 the DECISIONS
+  layer (level 7) is off entirely, so without this the fix would have been invisible at the very setting
+  most people use. The dial exists to lower the volume on the ordinary traffic of a working agent; a
+  refusal means something the owner asked for did not happen, and the owner is the one person who needs to
+  know. Everything else stays gated — a dial that does not reduce anything is not a dial.
 
-Item 1's refusal existed **only** as `[note] run refused: ...` in the locus's activity. A dashboard caller
-sees nothing, and it is not in `myriaxon.log` either.
+### Found while fixing item 8: `layer_name` was `null` in every served event
 
-**Recommend:** route refusals through the transparency feed at the DECISIONS layer, which already exists for
-exactly this ("the half a log usually omits") and is already streamed to the UI.
+`Event.layer_name` is a `@property`, and `to_dict` used `asdict`, which only walks dataclass FIELDS. So the
+API served `"layer_name": null` for every event while the attribute was perfectly correct in Python.
+`to_dict` now includes it, which makes Python the single source of truth for layer names instead of the
+dashboard's separate JavaScript copy that could silently drift.
+
+---
+
+## Verified live, after the changes
+
+Against the running dashboard, over HTTP, the way the browser sees it:
+
+```
+dial set to 3 (the default where refusals used to vanish)
+POST /api/loci {action: run}  ->  accepted: False
+                                  "verify-37141 is already running (pid 40944, started 14:52:21)"
+feed at level 3               ->  1 refusal, layer 7, gate 'locus-run', locus named
+last_outcome served           ->  {ok: True, kind: success, attempts: 1, summary: 'run completed'}
+has_session served            ->  present
+```
+
+---
+
+## Still open, and deliberately not changed in this pass
+
+### 9. `run_locus` schedules on a worker thread, so the outcome arrives asynchronously — **OPEN, by design**
+
+`accepted: True` now means the run genuinely started, but not that it finished. A caller that wants the
+result polls the transcript or reads `last_outcome`. That is the right shape for a long-running agent, and
+changing it would mean blocking an HTTP request for minutes. Worth stating rather than fixing.
+
+### 10. The `LAYERS` table exists in both Python and JavaScript — **IMPROVED, still duplicated**
+
+`layer_name` is now served, so the JS copy is no longer load-bearing for labels. The JS map is still used
+for colour tone. Removing it entirely would mean serving the tone as well, which is a UI concern that does
+not belong in `transparency.py`.
+
+### 11. Orphaned launcher processes after a dashboard restart — **OPEN, environment**
+
+Six `myriaxon web` processes accumulated across restarts while only one held the port. Not a code defect:
+the CLI launcher spawns a child and the parent is not reaped when the child is killed by a tool rather than
+by the user. Worth a look in `cli.py`, but it does not affect a normal single-instance run.
 
 ---
 
 ## Method notes, recorded so the review can be repeated
 
-Two of my own measurement errors are worth keeping, because both produced **confident wrong answers**:
+Several of my own measurement errors are worth keeping, because every one produced a **confident wrong
+answer**:
 
 * **I reported a duplicated answer prefix as a bug.** `answer_delta` carries the **cumulative** answer and the
-  UI does `innerHTML = md(text)` — it *replaces*. My script **joined** the deltas, which concatenates the same
-  prefix repeatedly. `'TheThe file contains...'` was my harness, not the product.
+  UI does `innerHTML = md(text)` — it *replaces*. My script **joined** the deltas. `'TheThe file contains...'`
+  was my harness, not the product.
 * **I reported five 404s as broken panels.** They are POST-only routes; the panels read from `/api/config`.
+* **I wrote an unconsumed return value** in a test (`loci.get_ref() if False else ...`) and it passed review
+  of my own writing — a good argument for the verifier suite existing.
+* **A patch landed in the wrong function.** `"open_goals"` occurs twice in `server.py`, and a substring
+  splice takes the first, so `has_session` went into the refusal payload instead of the render dict. It
+  looked successful. Anchors must be unique, or located by index.
+* **I used a CSS variable that does not exist** (`--danger`). `tests/test_brand_consistency.py` failed the
+  build and was right to.
 
-Both are the same mistake: reading a result as a defect before checking how the consumer uses it. The
-correction in each case cost one query.
+The pattern in all five: verifying that a change *applied* is not the same as verifying it is *correct*.
 
 ## How to re-run this review
 
@@ -166,6 +223,12 @@ python .bench-tmp/e2e_tasks.py
 # 4. a locus, end to end
 python .bench-tmp/e2e_locus.py
 
-# 5. the log
+# 5. the two improvements, live
+python .bench-tmp/verify_live.py
+
+# 6. the caller's contract
+python -m pytest tests/test_locus_run_contract.py tests/test_locus_run_contract_extra.py -q
+
+# 7. the log
 grep -c "Reclaiming the run lease" ~/.myriaxon/logs/myriaxon.log    # 84 before the fix
 ```

@@ -976,6 +976,24 @@ def _pid_alive(pid: int) -> bool:
 # different owners, and each of those is genuinely new information.
 _ANNOUNCED_STALE_LEASES: set[tuple[str, int]] = set()
 
+# `Locus.is_running()` reads and parses the lease file, and the dashboard calls it per locus per poll.
+# A second is short enough that "working now" is never visibly stale and long enough that a panel open on
+# several loci stops re-reading the same unchanged file every few seconds. Only used when the caller asks
+# for the present (no explicit `now`), so an expiry test still gets a fresh read.
+_RUNNING_CACHE: dict[str, tuple[float, bool]] = {}
+_RUNNING_CACHE_SECONDS = 1.0
+
+
+def _forget_running(locus_id: str) -> None:
+    """Drop the cached answer for a locus, so the next question reads the disk.
+
+    Called wherever this process CHANGES the answer -- acquiring or releasing a lease -- because a cache
+    that outlives the fact it caches is how a panel shows "working now" for a run that has finished, or
+    refuses one that has not started. The TTL is the backstop for changes made by OTHER processes; this is
+    what keeps the common case exact.
+    """
+    _RUNNING_CACHE.pop(locus_id, None)
+
 
 def _announce_reclaimed_lease(path: Path, locus_id: str, pid: int) -> None:
     """Say once that a lease's owner is gone. The file is NOT deleted here.
@@ -1347,6 +1365,9 @@ class Locus:
     # than one because the timestamp is what makes the flag self-healing: a flag with no age can
     # only ever say "busy", including for a process that died an hour ago.
     running: bool = False
+    # The outcome of the last completed run, for a surface that needs to answer "did it work?".
+    # Empty until a run finishes; never persisted as a live state (see from_dict).
+    last_outcome: dict[str, Any] = field(default_factory=dict)
     run_started_at: float = 0.0
     # The last failure recorded for this locus, whether or not it belonged to a goal.
     last_error: str = ""
@@ -1495,6 +1516,41 @@ class Locus:
             requested = DEFAULT_SELF_DIRECTED_STEPS
         return max(1, min(requested, MAX_STEPS_PER_RUN_CEILING))
 
+    def may_run(self) -> tuple[bool, str, "RunLease | None"]:
+        """May this locus start a run? Returns ``(ok, reason, holder)``.
+
+        ONE DECISION, NAMED ONCE -- the same shape as ``tools.shell_may_run``, and for the same reason.
+
+        This project has already been bitten twice by a control that held on one path and not another
+        doing the same thing, and a third instance was found by driving the dashboard:
+
+            POST /api/loci {action: run}  ->  {'accepted': True, 'reason': ''}
+            locus record                  ->  running=True, session_id=None, open_goals unchanged
+            transcript                    ->  the user prompt only. No assistant turn ever.
+            activity                      ->  [note] run refused: this locus is already running
+
+        Two places decided whether a run could start. `run_locus` at SUBMIT time checked the session's
+        busy flag; `Locus.run_scope` at RUN time checked the lease. Only the second was authoritative, so
+        the submit path reported a success the worker then refused -- and the caller had nothing to act on.
+
+        Both now ask this. `ok` is False and `reason` says why, so a caller can never be told "accepted"
+        about a run that will not happen.
+
+        A lease whose owner is GONE is not a holder: `read_run_lease` returns None for it and
+        `acquire_run_lease` reclaims it, so a crashed process does not lock its locus out forever.
+        """
+        if not self.enabled:
+            return False, f"{self.name} is disabled. Enable it before running.", None
+        holder = read_run_lease(self)
+        if holder is not None:
+            # `describe()` carries the pid and the start time. "Already running" without those is the
+            # kind of message that sends somebody hunting through log files.
+            return (False,
+                    f"{self.name} is already running ({holder.describe()}). Wait for that run to finish, "
+                    "or clear the lease in its workspace if the process that held it is gone.",
+                    holder)
+        return True, "", None
+
     def is_running(self, now: float | None = None) -> bool:
         """Whether a run is in flight for this locus right now -- here or in another process.
 
@@ -1509,13 +1565,26 @@ class Locus:
         due in an hour?" still cannot schedule a run that is happening right now. The lease is on
         disk and is judged against ``now``, which is what makes expiry testable without waiting
         half an hour for it.
+
+        THE LEASE READ IS CACHED FOR A SECOND, and only when `now` is None. The lease file is read and
+        JSON-parsed on every call, and the dashboard calls this **per locus per poll** -- so a panel open
+        on four loci was doing four file reads and four parses every few seconds to answer a question
+        whose answer cannot change meaningfully in that window. A caller that passes an explicit `now` is
+        asking a hypothetical ("would this be due at 3pm?") and always gets a fresh read, which is what
+        keeps the expiry tests honest.
         """
         if self.running:
             started = self.run_started_at or time.time()
             if (time.time() - started) <= RUN_LEASE_STALE_SECONDS:
                 return True
-        read_at = time.time() if now is None else now
-        return read_run_lease(self, now=read_at) is not None
+        if now is None:
+            cached = _RUNNING_CACHE.get(self.id)
+            if cached is not None and (time.time() - cached[0]) < _RUNNING_CACHE_SECONDS:
+                return cached[1]
+            answer = read_run_lease(self) is not None
+            _RUNNING_CACHE[self.id] = (time.time(), answer)
+            return answer
+        return read_run_lease(self, now=now) is not None
 
     def heartbeat_prompt(self) -> str:
         """The turn text for a standing-check wake-up.
@@ -1857,14 +1926,20 @@ class Locus:
         returned silently -- a run that did not happen for a reason nobody can see is
         indistinguishable from a bug, which is the failure this module exists to eliminate.
         """
+        # The refusal is produced by `may_run` and only FORMATTED here, so there is exactly one place that
+        # decides whether this locus may run and exactly one sentence that says why. Before `may_run`
+        # existed, `run_locus` consulted the session's busy flag at submit time and this consulted the
+        # lease at run time -- so a caller was told "accepted" about a run this line then refused.
         lease = acquire_run_lease(self)
         if lease is None:
-            holder = read_run_lease(self)
+            _, reason, holder = self.may_run()
             who = f" ({holder.describe()})" if holder is not None else ""
-            self.log("note", f"run refused: this locus is already running{who}")
+            self.log("note", f"run refused: {reason or f'this locus is already running{who}'}")
             return False
         self._lease = lease
         self.running = True
+        # The answer to "is it running?" just changed, and this process is what changed it.
+        _forget_running(self.id)
         self.run_started_at = time.time()
         self._completed_goals_at_start = {g.id for g in self.goals if g.status == GOAL_DONE}
         self._reflection_used = False
@@ -1890,8 +1965,41 @@ class Locus:
         lease, self._lease = self._lease, None
         if lease is not None:
             lease.release()
+        # THIS PROCESS caused the change, so a cached answer is now wrong -- drop it rather than let a
+        # panel show "working now" for up to a second after the work finished.
+        _forget_running(self.id)
 
         report = normalize_outcome(outcome)
+        # WHAT ACTUALLY HAPPENED, kept on the record so a surface can show it.
+        #
+        # Before this, a finished run left the panel able to say only "idle": the transcript held the
+        # model's prose and the activity log held the outcome, but neither is where a person looks to
+        # answer "did the last run work?". Measured -- a run that could not start and a run that finished
+        # cleanly produced the SAME panel state, which is the defect this field closes.
+        self.last_outcome = {
+            "ok": bool(report.ok),
+            "kind": report.kind or "",
+            "attempts": int(report.attempts or 0),
+            "summary": report.describe(),
+            "error": str(report.error or "")[:400],
+            # When, so a surface can say "12s ago" instead of presenting a stale result as current.
+            "at": time.time(),
+        }
+        # AND IT HAS TO REACH THE DISK, or it is invisible in the one place it was added for.
+        #
+        # Found by testing the panel: `_loci_payload` reloads from `loci.json` on every request, so an
+        # outcome held only in memory was discarded before it could be rendered. The field would have
+        # existed, been correct, and never appeared -- the exact failure it was meant to fix.
+        #
+        # `persist` rather than `save`: persist reloads first and re-inserts THIS locus, so a concurrent
+        # edit from the terminal is not reverted. Best-effort, because a locus that cannot write its record
+        # must still finish its run -- losing a diagnostic is not worth failing work over.
+        try:
+            from_registry = get_registry()
+            if from_registry.get(self.id) is not None:
+                from_registry.persist(self)
+        except Exception:  # noqa: BLE001 - see above
+            pass
         if report.ok:
             self.last_error = ""
             self.log("turn", report.describe())

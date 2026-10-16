@@ -1008,6 +1008,28 @@ INDEX_HTML = r"""<!DOCTYPE html>
             white-space: nowrap; }
   .lc-state { font-size: 10.5px; color: var(--text-3); white-space: nowrap; }
   .lc-state.running { color: var(--signal); }
+  /* The outcome of the last run. Present so a run that FAILED and a run that never started are
+     distinguishable from one that worked -- before this, all three rendered as "N open objective(s)". */
+  .locusoutcome {
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+    margin-top: 6px; font-size: 11.5px; line-height: 1.35; color: var(--muted);
+  }
+  .locusoutcome.good { color: var(--muted); }
+  /* `--err`, not a literal or a made-up name: `tests/test_brand_consistency.py` fails the build on any CSS
+     variable that is referenced but never declared, and it caught exactly that here. The theme already
+     maps --err to --red per colour scheme, so the failure colour also follows light/dark for free. */
+  .locusoutcome.bad { color: var(--err); }
+  .lc-out-dot {
+    width: 6px; height: 6px; border-radius: 50%; flex: none;
+    background: currentColor; opacity: 0.75;
+  }
+  .locusoutcome.bad .lc-out-dot { opacity: 1; }
+  /* A failure message can be long and comes from a model or a file, so it is data: wrapped, clamped, and
+     never allowed to stretch the card. */
+  .lc-out-err {
+    flex-basis: 100%; opacity: 0.85; font-size: 11px;
+    overflow-wrap: anywhere; white-space: pre-wrap; max-height: 3.6em; overflow: hidden;
+  }
   .lc-state.paused { color: var(--amber); }
 
   .lc-controls { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 12px;
@@ -4425,10 +4447,42 @@ function renderSettings() {
         <span class="locusrole">${esc(locus.role)}</span>
         ${flags}
       </div>
-      <div class="locusmeta">${locus.open_goals} open objective(s) · ${esc(locus.workspace)}</div>`;
+      <div class="locusmeta">${locus.open_goals} open objective(s) · ${esc(locus.workspace)}</div>
+      ${lastOutcomeLine(locus)}`;
     // Clicking the row opens that locus's own chat. There is no "take over my chat" action any more.
     row.onclick = () => openLocusChat(locus.name);
     return row;
+  }
+
+  // WHAT THE LAST RUN DID, on the card, because otherwise it is invisible.
+  //
+  // Measured: a locus whose run had been REFUSED and a locus whose run had finished cleanly rendered
+  // identically -- both just "N open objective(s)". The refusal lived in the activity log, which needs the
+  // panel open on that locus and is easy to scroll past, and a run that silently did nothing looked the
+  // same as one that was working. The server now sends `last_outcome`; this is the half that makes it
+  // visible, because a field nobody renders is still invisible.
+  //
+  // Rendered as DATA, never as markup: the summary comes from `RunOutcome.describe()` and an error can
+  // carry model output, so it goes through `esc`.
+  function lastOutcomeLine(locus) {
+    const o = locus.last_outcome;
+    if (!o || !o.summary) return "";
+    const age = o.at ? timeAgo(o.at) : "";
+    const failed = !o.ok;
+    const retried = (o.attempts || 0) > 1 ? ` after ${o.attempts} attempts` : "";
+    return `<div class="locusoutcome ${failed ? "bad" : "good"}">
+        <span class="lc-out-dot"></span>${esc(o.summary)}${esc(retried)}${age ? ` · ${esc(age)}` : ""}
+        ${failed && o.error ? `<div class="lc-out-err">${esc(String(o.error).slice(0, 200))}</div>` : ""}
+      </div>`;
+  }
+
+  // "12s ago" rather than a timestamp, because the question the line answers is "is this current?".
+  function timeAgo(at) {
+    const secs = Math.max(0, Math.floor(Date.now() / 1000 - at));
+    if (secs < 45) return "just now";
+    if (secs < 5400) return `${Math.round(secs / 60)}m ago`;
+    if (secs < 172800) return `${Math.round(secs / 3600)}h ago`;
+    return `${Math.round(secs / 86400)}d ago`;
   }
 
   function renderLoci() {

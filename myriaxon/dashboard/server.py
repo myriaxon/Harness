@@ -458,6 +458,43 @@ class DashboardApp:
         self._supervisor = None
         self._supervisor_stop = None
 
+    def _refuse_locus_run(self, locus, reason: str, holder=None) -> None:
+        """Record a refused run at the DECISIONS layer, which is what that layer is FOR.
+
+        Measured before this: `transparency.emit` had exactly ONE call site in the whole codebase, and it
+        was `set_level` announcing that the level had changed. The DECISIONS layer is described in
+        `transparency.py` as "gates: refusals, confirmations, risk, budget" -- and no refusal had ever been
+        emitted to it. A dial that shows a category of event the program never produces is not
+        transparency; it is a panel that looks wired up.
+
+        This is the concrete case the user hit: a Locus run that was refused appeared ONLY in the locus's
+        own activity log, which is per-locus, needs the panel open on that locus, and is not streamed. The
+        feed is where a refusal belongs, because "something I asked for did not happen" is exactly the
+        class of event a person needs to see without going looking for it.
+
+        Best-effort by design: transparency is a diagnostic, and a diagnostic that can break the feature it
+        describes is worse than one that is briefly missing an entry.
+        """
+        try:
+            from .. import transparency
+
+            transparency.emit(
+                transparency.DECISIONS,
+                "refused",
+                summary=f"{locus.name}: {reason}",
+                locus=locus.name,
+                detail={
+                    "gate": "locus-run",
+                    "holder": holder.describe() if holder is not None else "",
+                    "open_goals": len(locus.open_goals()),
+                },
+                # A refusal is shown whatever the dial is set to; see emit for why this category is the
+                # only one with that exception.
+                always=True,
+            )
+        except Exception:  # noqa: BLE001 - never let the feed break the decision it records
+            pass
+
     def run_locus(self, locus, message: str = "") -> dict:
         """Give a locus a turn in a real session, so the browser watches it like any other turn.
 
@@ -494,32 +531,30 @@ class DashboardApp:
                 "locus": locus.name,
             }
 
-        # IS ANOTHER RUN ALREADY IN THE SLOT? Asked HERE, before anything is scheduled, because the
-        # answer is only useful to the caller at submit time.
+        # MAY THIS LOCUS RUN? One decision, asked of the locus rather than re-derived here.
         #
-        # Measured defect: the lease was consulted only inside the turn's worker thread, by `run_scope`,
-        # so a run that could not possibly start still returned `accepted: True` -- and the refusal went
-        # to the locus's ACTIVITY LOG, where a dashboard caller never looks. Reproduced:
+        # Measured defect: this path and `Locus.run_scope` each decided independently, and only the second
+        # was authoritative -- so a run that could not start still returned `accepted: True`, and the
+        # refusal went to the locus's ACTIVITY LOG, where a dashboard caller never looks. Reproduced:
         #
         #     run_locus -> {'accepted': True, 'reason': 'diag was claimed by another run...'}
         #     activity  -> [note] run refused: this locus is already running (pid 3456)
         #     result    -> running=True, session_id=None, open_goals unchanged, no assistant turn
         #
-        # The client saw success and nothing happened. That is worse than a plain failure, because there
-        # is no error to act on: the panel shows "working now" forever and the goal never advances.
+        # The client saw success and nothing happened. That is worse than a plain failure, because there is
+        # no error to act on: the panel shows "working now" forever and the goal never advances.
         #
-        # `read_run_lease` returns None when the holder is gone, so this does not refuse a run because of
-        # a dead process -- `acquire_run_lease` reclaims those, and `_announce_reclaimed_lease` says so
-        # once.
-        holder = loci_module.read_run_lease(locus)
-        if holder is not None:
+        # `may_run` is the single answer both callers now use, so this cannot drift from the worker again.
+        # It returns None for a lease whose owner is GONE -- `acquire_run_lease` reclaims those -- so a
+        # crashed process does not refuse anything.
+        ok, reason, holder = locus.may_run()
+        if not ok:
+            self._refuse_locus_run(locus, reason, holder)
             return {
                 "accepted": False,
-                "reason": f"{locus.name} is already running ({holder.describe()}). "
-                          "Wait for that run to finish, or clear the lease in its workspace if the "
-                          "process that held it is gone.",
+                "reason": reason,
                 "locus": locus.name,
-                "holder": holder.describe(),
+                "holder": holder.describe() if holder is not None else "",
             }
 
         session = None
@@ -765,6 +800,10 @@ class DashboardApp:
                 # tell "working" from "waiting" in the UI, and a user clicking Run on a busy locus got a
                 # full turn interleaved with one already in flight.
                 "running": locus.is_running(),
+                # WHAT THE LAST RUN ACTUALLY DID. Without this, a finished run and a run that never
+                # started produced the SAME panel state -- "idle" -- so the two were indistinguishable
+                # at a glance, which is how a refused run went unnoticed. None until a run completes.
+                "last_outcome": getattr(locus, "last_outcome", None) or None,
                 # Why it is not working on its own, or "" when it would. Served rather than derived in
                 # the browser so the CLI and the panel cannot disagree about the same locus.
                 "idle_reason": idle_reason(locus),
@@ -781,6 +820,10 @@ class DashboardApp:
                     for g in locus.goals
                 ],
                 "open_goals": len(locus.open_goals()),
+                # Whether a transcript exists to open. `running` True with no session is a state no caller
+                # can use -- the panel would offer a conversation that does not exist -- so it is served
+                # explicitly rather than left to be inferred from two fields that could disagree.
+                "has_session": bool(getattr(locus, "session_id", None)),
                 # Most recent first: the panel answers "what has it been doing", and the newest
                 # entry is the one that answers it.
                 "activity": [
