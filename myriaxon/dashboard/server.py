@@ -494,6 +494,34 @@ class DashboardApp:
                 "locus": locus.name,
             }
 
+        # IS ANOTHER RUN ALREADY IN THE SLOT? Asked HERE, before anything is scheduled, because the
+        # answer is only useful to the caller at submit time.
+        #
+        # Measured defect: the lease was consulted only inside the turn's worker thread, by `run_scope`,
+        # so a run that could not possibly start still returned `accepted: True` -- and the refusal went
+        # to the locus's ACTIVITY LOG, where a dashboard caller never looks. Reproduced:
+        #
+        #     run_locus -> {'accepted': True, 'reason': 'diag was claimed by another run...'}
+        #     activity  -> [note] run refused: this locus is already running (pid 3456)
+        #     result    -> running=True, session_id=None, open_goals unchanged, no assistant turn
+        #
+        # The client saw success and nothing happened. That is worse than a plain failure, because there
+        # is no error to act on: the panel shows "working now" forever and the goal never advances.
+        #
+        # `read_run_lease` returns None when the holder is gone, so this does not refuse a run because of
+        # a dead process -- `acquire_run_lease` reclaims those, and `_announce_reclaimed_lease` says so
+        # once.
+        holder = loci_module.read_run_lease(locus)
+        if holder is not None:
+            return {
+                "accepted": False,
+                "reason": f"{locus.name} is already running ({holder.describe()}). "
+                          "Wait for that run to finish, or clear the lease in its workspace if the "
+                          "process that held it is gone.",
+                "locus": locus.name,
+                "holder": holder.describe(),
+            }
+
         session = None
         if locus.session_id:
             session = self.sessions.get(locus.session_id)

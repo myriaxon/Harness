@@ -971,6 +971,48 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+# Which stale leases have already been announced, so a DEAD owner is reported ONCE rather than on every
+# poll. Keyed by (lease path, pid), because the same locus can leave several stale leases over a day with
+# different owners, and each of those is genuinely new information.
+_ANNOUNCED_STALE_LEASES: set[tuple[str, int]] = set()
+
+
+def _announce_reclaimed_lease(path: Path, locus_id: str, pid: int) -> None:
+    """Say once that a lease's owner is gone. The file is NOT deleted here.
+
+    WHY THIS EXISTS. Measured in the real log on this machine:
+
+        INFO Reclaiming the run lease for 2508c6d7: its owner (pid 14092) is gone   x 40
+        INFO Reclaiming the run lease for 2508c6d7: its owner (pid 17980) is gone   x 15
+        ... 84 lines in total, for SEVEN distinct dead pids
+
+    Every one of those lines was true, and the repetition made them worthless. `read_run_lease` is called
+    from `Locus.is_running()`, which the dashboard polls to decide whether to show "working now", so a
+    single dead owner was logged on every poll for as long as the lease file survived -- up to the
+    30-minute stale window. 84 identical INFO lines train a reader to ignore the log, which is the same
+    failure this repository has already recorded twice for other diagnostics: **a message nobody reads is
+    a message that is not there.**
+
+    It is logged at INFO and not WARNING deliberately. Reclaiming is the system working: the owner died and
+    the next run takes the slot. A warning would be for the case where a stale lease actually PREVENTS
+    something, which it does not -- `acquire_run_lease` unlinks it and proceeds.
+
+    Deliberately does NOT unlink. This function runs on a READ path, and deleting a file because it looks
+    stale is how a read becomes a mutation: two processes polling the same stale lease would race to
+    unlink, and a lease created between the `_pid_alive` check and the unlink would be destroyed by a
+    reader. Reclamation belongs to the acquirer, which already does it under `O_EXCL`.
+    """
+    key = (str(path), int(pid))
+    if key in _ANNOUNCED_STALE_LEASES:
+        return
+    _ANNOUNCED_STALE_LEASES.add(key)
+    logger.info(
+        "Reclaiming the run lease for %s: its owner (pid %s) is gone. "
+        "Said once per stale lease -- the file is left for the next acquire to take over.",
+        locus_id, pid,
+    )
+
+
 def _lease_from_path(
     path: Path, locus_id: str, *, now: float, stale_after: float
 ) -> "RunLease | None":
@@ -992,9 +1034,7 @@ def _lease_from_path(
     # for the full stale window even though the owning process was gone. The mtime only bounds how
     # long a *forgotten* lease can live; it cannot see that the owner died a second ago.
     if not _pid_alive(pid):
-        logger.info(
-            "Reclaiming the run lease for %s: its owner (pid %s) is gone", locus_id, pid
-        )
+        _announce_reclaimed_lease(path, locus_id, pid)
         return None
     return RunLease(
         locus_id=locus_id,
